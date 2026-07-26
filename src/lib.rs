@@ -346,3 +346,212 @@ fn require_admin(env: &Env) -> Result<(), AmmError> {
     admin.require_auth();
     Ok(())
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::token::{StellarAssetClient, TokenClient};
+
+    #[test]
+    fn isqrt_handles_i128_max_without_overflow() {
+        let root = isqrt(i128::MAX);
+        assert!(root > 0);
+        assert!(root <= i128::MAX / root);
+        assert!((root + 1) > i128::MAX / (root + 1));
+    }
+
+    // a fresh AMM seeded with 1,000,000 of each token (reserves synced to the real balances)
+    fn seed(env: &Env) -> (MiniAmmClient<'static>, Address, Address, Address) {
+        let admin = Address::generate(env);
+        let ta = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let tb = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let amm_id = env.register(MiniAmm, ());
+        let amm = MiniAmmClient::new(env, &amm_id);
+        amm.init(&admin, &ta, &tb);
+        StellarAssetClient::new(env, &ta).mint(&amm_id, &1_000_000);
+        StellarAssetClient::new(env, &tb).mint(&amm_id, &1_000_000);
+        amm.sync();
+        (amm, ta, tb, amm_id)
+    }
+
+    // AMM-1: calling swap WITHOUT pushing the input pays out nothing and leaves liquidity intact.
+    #[test]
+    fn swap_without_pushing_input_is_rejected_no_drain() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (amm, ta, tb, amm_id) = seed(&env);
+        let attacker = Address::generate(&env);
+        let res = amm.try_swap(&ta, &500_000, &0, &attacker); // claims input, pushes nothing
+        assert!(res.is_err(), "swap with no pushed input must be rejected");
+        assert_eq!(TokenClient::new(&env, &tb).balance(&attacker), 0, "attacker received nothing");
+        assert_eq!(TokenClient::new(&env, &tb).balance(&amm_id), 1_000_000, "AMM liquidity intact");
+    }
+
+    // the documented push-then-swap path still works and gives a sane constant-product output.
+    #[test]
+    fn honest_push_then_swap_pays_out() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (amm, ta, tb, amm_id) = seed(&env);
+        let user = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&user, &100_000);
+        TokenClient::new(&env, &ta).transfer(&user, &amm_id, &100_000); // PUSH first
+        let out = amm.swap(&ta, &100_000, &0, &user);
+        assert!(out > 0 && out < 100_000, "sane constant-product output");
+        assert_eq!(TokenClient::new(&env, &tb).balance(&user), out);
+    }
+
+    // AMM-1: lying about amount_in cannot inflate the payout — it is bound to the REAL pushed value.
+    #[test]
+    fn lying_about_amount_in_cannot_inflate_payout() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (amm, ta, _tb, amm_id) = seed(&env);
+        let user = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&user, &100_000);
+        TokenClient::new(&env, &ta).transfer(&user, &amm_id, &100_000); // pushed 100k
+        let out = amm.swap(&ta, &1_000_000, &0, &user); // claims 10x
+        let expected = (1_000_000i128 * (100_000 * 997)) / (1_000_000 * 1000 + 100_000 * 997);
+        assert_eq!(out, expected, "payout bound to the pushed 100k, not the claimed 1M");
+    }
+
+    // a fresh (un-seeded) AMM so add_liquidity is the first liquidity
+    fn fresh(env: &Env) -> (MiniAmmClient<'static>, Address, Address) {
+        let admin = Address::generate(env);
+        let ta = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let tb = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let amm = MiniAmmClient::new(env, &env.register(MiniAmm, ()));
+        amm.init(&admin, &ta, &tb);
+        (amm, ta, tb)
+    }
+
+    // LP: add liquidity (first = sqrt(a*b), then pro-rata) and remove it for the pro-rata reserves back.
+    #[test]
+    fn lp_add_then_remove_roundtrip() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (amm, ta, tb) = fresh(&env);
+        let lp1 = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&lp1, &1_000_000);
+        StellarAssetClient::new(&env, &tb).mint(&lp1, &1_000_000);
+        // first mint = sqrt(a*b) = 1_000_000, but MINIMUM_LIQUIDITY (1000) is permanently locked, so the
+        // provider is credited 999_000 while LpSupply carries the full 1_000_000.
+        assert_eq!(amm.add_liquidity(&lp1, &1_000_000, &1_000_000), 999_000, "first LP mints sqrt(a*b) - MIN_LIQ");
+        assert_eq!(amm.lp_supply(), 1_000_000, "supply includes the locked MIN_LIQ");
+        assert_eq!(amm.reserves(), (1_000_000, 1_000_000));
+
+        let lp2 = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&lp2, &500_000);
+        StellarAssetClient::new(&env, &tb).mint(&lp2, &500_000);
+        assert_eq!(amm.add_liquidity(&lp2, &500_000, &500_000), 500_000, "second LP mints pro-rata (unaffected by lock)");
+        assert_eq!(amm.reserves(), (1_500_000, 1_500_000));
+
+        let (a_out, b_out) = amm.remove_liquidity(&lp1, &999_000);
+        assert_eq!((a_out, b_out), (999_000, 999_000), "LP1 gets its pro-rata share back");
+        assert_eq!(amm.lp_balance(&lp1), 0);
+        assert_eq!(amm.reserves(), (501_000, 501_000));
+        // LP1 recovers 999_000 of its 1_000_000 — the 1000 forfeited to the lock stays in the pool forever.
+        assert_eq!(TokenClient::new(&env, &ta).balance(&lp1), 999_000);
+        assert!(amm.lp_supply() >= 1_000, "the locked MIN_LIQ can never be removed, so supply never hits 0");
+    }
+
+    #[test]
+    fn remove_more_than_held_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (amm, ta, tb) = fresh(&env);
+        let lp = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&lp, &1_000_000);
+        StellarAssetClient::new(&env, &tb).mint(&lp, &1_000_000);
+        amm.add_liquidity(&lp, &1_000_000, &1_000_000); // credits 999_000 (MIN_LIQ locked)
+        assert!(amm.try_remove_liquidity(&lp, &2_000_000).is_err(), "cannot burn more shares than held");
+    }
+
+    #[test]
+    fn first_mint_locks_minimum_liquidity() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (amm, ta, tb) = fresh(&env);
+        let lp = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&lp, &1_000_000);
+        StellarAssetClient::new(&env, &tb).mint(&lp, &1_000_000);
+        // a first seed whose sqrt(a*b) <= MINIMUM_LIQUIDITY (1000) reverts — it can't cover the lock.
+        assert!(amm.try_add_liquidity(&lp, &1_000, &1_000).is_err(), "seed == MIN_LIQ is too small (sqrt=1000)");
+        assert!(amm.try_add_liquidity(&lp, &900, &900).is_err(), "seed below MIN_LIQ reverts");
+        // a first seed just above the lock mints (sqrt - MIN_LIQ) to the provider; the diff stays locked.
+        assert_eq!(amm.add_liquidity(&lp, &4_000, &4_000), 3_000, "sqrt(16e6)=4000, minus 1000 locked");
+        assert_eq!(amm.lp_supply(), 4_000, "supply carries provider shares + the locked 1000");
+        assert_eq!(amm.lp_balance(&lp), 3_000, "provider is credited only the unlocked shares");
+    }
+
+    // quote_add returns the balanced counter-leg; feeding it back makes sa == sb so the pro-rata
+    // mint donates nothing (min(sa,sb) is not clipped). Also rejects an un-seeded pool.
+    #[test]
+    fn quote_add_balances_the_ratio_no_donation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (amm, ta, tb) = fresh(&env);
+        // un-seeded pool -> ratio undefined
+        assert!(amm.try_quote_add(&1_000).is_err(), "quote on empty pool must fail (NoLiquidity)");
+        // seed at a 2:1 ratio (reserveA:reserveB)
+        let lp1 = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&lp1, &2_000_000);
+        StellarAssetClient::new(&env, &tb).mint(&lp1, &1_000_000);
+        amm.add_liquidity(&lp1, &2_000_000, &1_000_000);
+        assert_eq!(amm.reserves(), (2_000_000, 1_000_000));
+        // ideal B for 400_000 A at a 2:1 pool = 200_000
+        assert_eq!(amm.quote_add(&400_000), 200_000, "quote_add = amount_a * rb / ra");
+        // adding the quoted counter-leg mints the full pro-rata shares (sa == sb, nothing clipped)
+        let lp2 = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&lp2, &400_000);
+        StellarAssetClient::new(&env, &tb).mint(&lp2, &200_000);
+        let supply_before = amm.lp_supply();
+        let minted = amm.add_liquidity(&lp2, &400_000, &200_000);
+        // sa = 400_000*supply/2_000_000 = supply/5 ; sb = 200_000*supply/1_000_000 = supply/5 -> equal
+        assert_eq!(minted, supply_before / 5, "balanced add mints the un-clipped pro-rata shares");
+    }
+
+    // add_liquidity_min reverts Slippage (pool untouched) when the mint would fall below the floor.
+    #[test]
+    fn add_liquidity_min_floors_the_mint() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (amm, ta, tb) = fresh(&env);
+        let lp1 = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&lp1, &1_000_000);
+        StellarAssetClient::new(&env, &tb).mint(&lp1, &1_000_000);
+        amm.add_liquidity(&lp1, &1_000_000, &1_000_000); // supply now 1_000_000
+        let lp2 = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&lp2, &100_000);
+        StellarAssetClient::new(&env, &tb).mint(&lp2, &100_000);
+        // this add mints 100_000 shares; demanding 100_001 must revert and touch nothing
+        let supply_before = amm.lp_supply();
+        assert!(amm.try_add_liquidity_min(&lp2, &100_000, &100_000, &100_001).is_err(), "floor above mint -> Slippage");
+        assert_eq!(amm.lp_supply(), supply_before, "reverted add left supply untouched");
+        assert_eq!(amm.lp_balance(&lp2), 0, "reverted add credited no shares");
+        assert_eq!(TokenClient::new(&env, &ta).balance(&lp2), 100_000, "reverted add pulled no tokens");
+        // demanding exactly the mint succeeds
+        assert_eq!(amm.add_liquidity_min(&lp2, &100_000, &100_000, &100_000), 100_000, "floor == mint -> ok");
+    }
+
+    // remove_liquidity_min reverts Slippage (pool untouched) when either side would pay below the floor.
+    #[test]
+    fn remove_liquidity_min_floors_the_payout() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (amm, ta, tb) = fresh(&env);
+        let lp = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&lp, &1_000_000);
+        StellarAssetClient::new(&env, &tb).mint(&lp, &1_000_000);
+        amm.add_liquidity(&lp, &1_000_000, &1_000_000); // lp holds 999_000 shares, pool 1e6/1e6
+        // removing 500_000 shares pays 500_000 of each; demanding 500_001 on side A must revert
+        let supply_before = amm.lp_supply();
+        assert!(amm.try_remove_liquidity_min(&lp, &500_000, &500_001, &0).is_err(), "floor A above payout -> Slippage");
+        assert!(amm.try_remove_liquidity_min(&lp, &500_000, &0, &500_001).is_err(), "floor B above payout -> Slippage");
+        assert_eq!(amm.lp_supply(), supply_before, "reverted remove left supply untouched");
+        assert_eq!(amm.lp_balance(&lp), 999_000, "reverted remove burned no shares");
+        // demanding exactly the payout succeeds
+        assert_eq!(amm.remove_liquidity_min(&lp, &500_000, &500_000, &500_000), (500_000, 500_000), "floor == payout -> ok");
+    }
+}

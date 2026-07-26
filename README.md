@@ -187,6 +187,17 @@ target/wasm32v1-none/release/mini_amm.wasm
 The release profile enables LTO, checked overflow, symbol stripping, one codegen
 unit, and abort-on-panic.
 
+## Tests
+
+The published suite covers balance-delta swap accounting, dishonest
+`amount_in` claims, constant-product payouts, first-mint liquidity locking,
+pro-rata LP accounting, quote ratios, slippage floors, and overflow-safe square
+roots.
+
+```bash
+cargo +1.91.0 test --locked
+```
+
 ## Deployment outline
 
 ```bash
